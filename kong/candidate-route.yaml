@@ -1,0 +1,118 @@
+# A/B CANDIDATE routing policy (Module-05-style experiment from the AWS workshop, moved to the gateway)
+#
+# Same service, a parallel route with ONE changed variable:
+#   - v2 target descriptions (adds the misroutes found in the last eval report)
+# The threshold (max cosine distance) is the SAME as control (1.0), so the A/B measures
+# the descriptions only. Lowering it would make routing stricter and cause 503 "No peers".
+#
+# Sync together with the main file:
+#   deck gateway sync kong/kong.yaml kong/candidate-route.yaml ...
+# Then evaluate both and compare:
+#   python3 eval/run_routing_eval.py --target live --route /assistant/chat --no-cache --out reports/control.json
+#   python3 eval/run_routing_eval.py --target live --route /assistant/chat-candidate --no-cache --out reports/candidate.json
+#   python3 eval/run_routing_eval.py compare reports/control.json reports/candidate.json
+
+_format_version: "3.0"
+_info:
+  select_tags:
+    - shopglobal-ai
+
+routes:
+  - name: assistant-chat-candidate
+    service:
+      name: shop-assistant
+    paths: ["/assistant/chat-candidate"]
+    methods: ["POST"]
+    strip_path: true
+    plugins:
+      - name: key-auth
+        config:
+          key_names: ["apikey"]
+          hide_credentials: true
+      - name: acl
+        config:
+          allow: ["eval"]          # candidate is not exposed to real shoppers
+          hide_groups_header: true
+      - name: ai-prompt-guard
+        config:
+          deny_patterns:
+            - "(?i)ignore (all |your |the )?(previous |prior )?instructions"
+            - "(?i)ignora (todas )?(tus|las) instrucciones"
+            - "(?i)system prompt"
+            - "(?i)jailbreak"
+            - "(?i)\\b(write|do)\\b.{0,40}\\b(essay|homework|assignment)\\b"
+            - "(?i)\\b(escribe|haz)\\b.{0,40}\\b(ensayo|tarea|deberes)\\b"
+      - name: ai-prompt-decorator
+        config:
+          prompts:
+            prepend:
+              - role: system
+                content: >-
+                  You are the ShopGlobal shopping assistant. Always reply in the
+                  same language the customer used (English or Spanish). Answer
+                  only from the order and product facts provided. Be concise:
+                  at most 3 short sentences for order-status questions.
+      - name: ai-proxy-advanced
+        config:
+          balancer:
+            algorithm: semantic
+            retries: 2
+            failover_criteria: ["error", "timeout", "http_429", "http_503"]
+          embeddings:
+            auth:
+              header_name: Authorization
+              header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+            model:
+              provider: openai
+              name: text-embedding-3-small
+          vectordb:
+            strategy: redis
+            distance_metric: cosine
+            threshold: 1.0
+            dimensions: 1536
+            redis:
+              host: redis-stack
+              port: 6379
+          targets:
+            - route_type: llm/v1/chat
+              description: >-
+                ONE simple order status lookup and nothing else: where is my order,
+                track my package, tracking number, did it ship, was it delivered,
+                delivery date, was it cancelled; also very short or slang messages
+                that only contain an order number. SOLO una consulta simple del
+                estado del pedido: dónde está mi pedido, rastrear, número de
+                seguimiento, ya lo mandaron, ya se entregó, cuándo llega, se canceló.
+              auth:
+                header_name: Authorization
+                header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+              model:
+                provider: openai
+                name: gpt-6-luna
+                options:
+                  max_tokens: 1024
+                  input_cost: 100000     # µ$ per 1M tokens
+                  output_cost: 500000
+              logging:
+                log_statistics: true
+                log_payloads: false
+            - route_type: llm/v1/chat
+              description: >-
+                Anything that needs judgement or has more than one request: product
+                recommendations, comparisons, gifts, budgets, explanations, returns,
+                refunds, exchanges, swapping an item, complaints, delivered but not
+                received, damaged items. Cualquier cosa que requiera criterio o tenga
+                varias peticiones: recomendaciones, comparar, regalos, presupuesto,
+                devoluciones, reembolsos, cambios, quejas, entregado pero no recibido.
+              auth:
+                header_name: Authorization
+                header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+              model:
+                provider: openai
+                name: gpt-6.1-sol
+                options:
+                  max_tokens: 1024
+                  input_cost: 2000000    # µ$ per 1M tokens
+                  output_cost: 10000000
+              logging:
+                log_statistics: true
+                log_payloads: false

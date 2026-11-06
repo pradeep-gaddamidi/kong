@@ -1,0 +1,96 @@
+openapi: 3.0.3
+info:
+  title: ShopGlobal Catalog API
+  version: 1.0.0
+  description: Search the product catalog and read product details (prices, specs, return policy).
+  contact:
+    name: ShopGlobal Platform Team
+
+servers:
+  - url: http://mock-order-api:8081
+
+x-kong-name: catalog-api
+x-kong-tags: [shopglobal-ai, apiops, catalog]
+x-kong-plugin-key-auth:
+  config:
+    key_names: [apikey]
+    hide_credentials: true
+x-kong-plugin-proxy-cache-advanced:
+  config:
+    strategy: memory
+    cache_ttl: 300          # catalog changes rarely
+    content_type: [application/json, "application/json; charset=utf-8"]
+    response_code: [200]
+    request_method: [GET]
+
+security:
+  - apikey: []
+
+paths:
+  /api/products:
+    get:
+      operationId: listProducts
+      summary: List or search products
+      tags: [catalog]
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive search in name, category and description
+          schema: {type: string, example: earbuds}
+      responses:
+        "200":
+          description: Matching products
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items: {$ref: "#/components/schemas/Product"}
+        "401":
+          description: Missing or invalid API key
+  /api/products/{productId}:
+    get:
+      operationId: getProduct
+      summary: Get one product
+      tags: [catalog]
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: {type: string, pattern: '^PROD-\d{3}$', example: PROD-055}
+      responses:
+        "200":
+          description: The product
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Product"}
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Product not found
+
+components:
+  securitySchemes:
+    apikey:
+      type: apiKey
+      in: header
+      name: apikey
+  schemas:
+    Product:
+      type: object
+      required: [product_id, name, price]
+      properties:
+        product_id: {type: string, example: PROD-055}
+        name: {type: string, example: Noise Canceling Earbuds}
+        category: {type: string, example: Audio}
+        price: {type: number, example: 149.99}
+        description: {type: string}
+        specifications: {type: object, additionalProperties: true}
+        in_stock: {type: boolean}
+        stock_quantity: {type: integer}
+        rating: {type: number}
+        warranty: {type: string}
+        return_policy: {type: string}

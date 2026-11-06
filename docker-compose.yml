@@ -1,0 +1,85 @@
+# Local stack: Konnect data plane + Redis Stack (vectors + rate-limit counters)
+# + mock Order/Catalog API + bot backend + Prometheus/Grafana + Keycloak (OIDC for the customer-facing path).
+#
+#   cp .env.example .env   # fill in Konnect DP cert/endpoint values
+#   docker compose up -d
+#
+# Data plane values come from Konnect > Gateway Manager > your control plane >
+# "New data plane node" (Docker). Pin the image to the version your CP runs.
+
+services:
+  kong-dp:
+    # The lab runs Kong via scripts/run-kong-dp.sh (cert files, metrics on :8100).
+    # This service is only started on request:  docker compose --profile compose-dp up -d kong-dp
+    profiles: ["compose-dp"]
+    image: kong/kong-gateway:3.16
+    restart: unless-stopped
+    environment:
+      KONG_ROLE: data_plane
+      KONG_DATABASE: "off"
+      KONG_VITALS: "off"
+      KONG_CLUSTER_MTLS: pki
+      KONG_CLUSTER_CONTROL_PLANE: ${KONNECT_CP_ENDPOINT}:443
+      KONG_CLUSTER_SERVER_NAME: ${KONNECT_CP_ENDPOINT}
+      KONG_CLUSTER_TELEMETRY_ENDPOINT: ${KONNECT_TELEMETRY_ENDPOINT}:443
+      KONG_CLUSTER_TELEMETRY_SERVER_NAME: ${KONNECT_TELEMETRY_ENDPOINT}
+      KONG_CLUSTER_CERT: ${KONNECT_DP_CERT}
+      KONG_CLUSTER_CERT_KEY: ${KONNECT_DP_KEY}
+      KONG_LUA_SSL_TRUSTED_CERTIFICATE: system
+      KONG_KONNECT_MODE: "on"
+      KONG_STATUS_LISTEN: 0.0.0.0:8100
+    ports:
+      - "8000:8000"   # proxy
+      - "8100:8100"   # status + /metrics for Prometheus
+    depends_on: [redis-stack, mock-order-api]
+    deploy:
+      replicas: 1     # HA: run >=2 replicas behind a load balancer in staging/prod
+
+  redis-stack:
+    image: redis/redis-stack-server:7.4.0-v1   # RediSearch needed for vector similarity
+    restart: unless-stopped
+    ports: ["6379:6379"]
+
+  mock-order-api:
+    image: python:3.11-slim
+    working_dir: /app
+    command: python3 mock_apis/order_api.py --port 8081
+    volumes:
+      - ./:/app:ro
+    ports: ["8081:8081"]
+
+  bot:                    # ShopGlobal bot backend + demo chat page -> http://localhost:8090
+    image: python:3.11-slim
+    working_dir: /app
+    command: python3 bot/app.py
+    env_file: .env          # reads DECK_BOT_API_KEY
+    environment:
+      KONG_PROXY_URL: http://kong-dp:8000   # Kong on the compose network (alias kong-dp)
+    volumes:
+      - ./:/app:ro
+    ports: ["8090:8090"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/shopglobal-smart-routing.json
+    volumes:   # auto-load the Prometheus data source + ShopGlobal dashboard
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports: ["8180:8080"]

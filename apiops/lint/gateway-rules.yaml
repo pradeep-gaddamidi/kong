@@ -1,0 +1,16 @@
+# Lint rules for the BUILT gateway config (decK file), run before kong2tf/terraform.
+rules:
+  no-plaintext-provider-keys:
+    description: Provider credentials must be vault references, never literal keys
+    given: $..header_value
+    severity: error
+    then:
+      function: pattern
+      functionOptions: {match: "^\\{vault://"}
+  ai-proxy-costs-set:
+    description: AI targets must define input_cost/output_cost so budgets and cost metrics work
+    given: $..plugins[?(@.name=='ai-proxy-advanced')].config.targets[*].model.options
+    severity: error
+    then:
+      - {field: input_cost, function: truthy}
+      - {field: output_cost, function: truthy}

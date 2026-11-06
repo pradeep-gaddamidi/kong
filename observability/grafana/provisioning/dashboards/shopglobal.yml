@@ -1,0 +1,9 @@
+# Loads every dashboard JSON in /var/lib/grafana/dashboards (mounted by docker-compose.yml)
+apiVersion: 1
+providers:
+  - name: shopglobal
+    folder: ShopGlobal
+    type: file
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

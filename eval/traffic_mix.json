@@ -1,0 +1,9 @@
+{
+  "_note": "ASSUMED production traffic mix for the shopping bot, used to project cost per 1k conversations. Replace with real numbers from Kong's Prometheus metrics once live (Open Question in the Blueprint).",
+  "mix": {
+    "order_status": 0.70,
+    "complex": 0.20,
+    "borderline": 0.05,
+    "guardrail": 0.05
+  }
+}

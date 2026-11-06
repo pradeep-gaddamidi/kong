@@ -1,0 +1,59 @@
+# Platform-owned: LLM-as-judge route used only by the CI evaluation gate (ACL group "eval").
+_format_version: '3.0'
+services:
+- name: eval-judge
+  url: http://localhost:32000
+  routes:
+  - name: eval-judge
+    paths:
+    - /eval/judge
+    methods:
+    - POST
+    strip_path: true
+    plugins:
+    - name: key-auth
+      config:
+        key_names:
+        - apikey
+        hide_credentials: true
+      tags:
+      - shopglobal-ai
+      - platform
+      - eval
+    - name: acl
+      config:
+        allow:
+        - eval
+        hide_groups_header: true
+      tags:
+      - shopglobal-ai
+      - platform
+      - eval
+    - name: ai-proxy
+      config:
+        route_type: llm/v1/chat
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: gpt-6.1-sol
+          options:
+            max_tokens: 1200
+            input_cost: 2000000
+            output_cost: 10000000
+        logging:
+          log_statistics: true
+          log_payloads: false
+      tags:
+      - shopglobal-ai
+      - platform
+      - eval
+    tags:
+    - shopglobal-ai
+    - platform
+    - eval
+  tags:
+  - shopglobal-ai
+  - platform
+  - eval

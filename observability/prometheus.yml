@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: kong-dp
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["kong-dp:8100"]
+
+# Useful queries for the Grafana "Smart Routing" board
+# (metric names from the prometheus plugin with ai_metrics: true):
+#
+#   Spend per model ($/h)  (kong.yaml prices are in micro-dollars, so divide by 1e6):
+#     sum by (ai_model) (rate(kong_ai_llm_cost_total[1h])) * 3600 / 1e6
+#   Share of requests served by the cheap model:
+#     sum(rate(kong_ai_llm_requests_total{ai_model="gpt-6-luna"}[5m]))
+#       / sum(rate(kong_ai_llm_requests_total[5m]))
+#   Tokens per model:
+#     sum by (ai_model, token_type) (rate(kong_ai_llm_tokens_total[5m]))
+#   p95 LLM latency per model:
+#     histogram_quantile(0.95, sum by (le, ai_model) (rate(kong_ai_llm_provider_latency_ms_bucket[5m])))
+#   Semantic cache hit ratio:
+#     sum(rate(kong_ai_llm_requests_total{cache_status="Hit"}[5m])) / sum(rate(kong_ai_llm_requests_total[5m]))

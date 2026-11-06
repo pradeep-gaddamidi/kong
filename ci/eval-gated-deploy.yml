@@ -1,0 +1,108 @@
+# SUPERSEDED by .github/workflows/pr-checks.yml + deploy.yml (Terraform/APIOps).
+# Kept for reference: the original decK-sync version of the eval-gated pipeline.
+
+# Eval-gated deploy for the ShopGlobal AI Gateway
+# (the AWS workshop's "batch-evaluation release gate", moved in front of decK)
+#
+#   PR      -> validate config, run harness smoke test, diff against staging
+#   main    -> sync staging -> run live routing eval (+ LLM judge) -> GATE
+#           -> sync production (requires approval on the `production` environment)
+#
+# Required secrets: KONNECT_TOKEN, OPENAI_API_KEY, BOT_API_KEY,
+#                   EVAL_API_KEY, STAGING_PROXY_URL
+
+name: eval-gated-deploy
+
+on:
+  pull_request:
+    paths: ["kong/**", "eval/**", "data/routing_testset.json"]
+  push:
+    branches: [main]
+    paths: ["kong/**", "eval/**", "data/routing_testset.json"]
+  workflow_dispatch:
+
+env:
+  DECK_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  DECK_BOT_API_KEY: ${{ secrets.BOT_API_KEY }}
+  DECK_EVAL_API_KEY: ${{ secrets.EVAL_API_KEY }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kong/setup-deck@v1
+        with:
+          deck-version: "1.69.0"   # pin to the decK version your team uses
+          wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint decK files
+        run: deck file validate kong/kong.yaml kong/candidate-route.yaml
+      - name: Harness smoke test (offline, simulated router)
+        run: python3 eval/run_routing_eval.py --target simulate --no-fail --out reports/ci-smoke.json
+      - name: Diff against staging
+        if: github.event_name == 'pull_request'
+        run: |
+          deck gateway diff kong/kong.yaml kong/candidate-route.yaml \
+            --konnect-token "${{ secrets.KONNECT_TOKEN }}" \
+            --konnect-control-plane-name shopglobal-staging
+
+  deploy-staging:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kong/setup-deck@v1
+        with:
+          deck-version: "1.69.0"
+          wrapper: false
+      - name: Sync staging control plane
+        run: |
+          deck gateway sync kong/kong.yaml kong/candidate-route.yaml \
+            --konnect-token "${{ secrets.KONNECT_TOKEN }}" \
+            --konnect-control-plane-name shopglobal-staging
+
+  eval-gate:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Wait for config to reach data planes
+        run: sleep 20
+      - name: Live routing eval + LLM judge (release gate)
+        env:
+          KONG_PROXY_URL: ${{ secrets.STAGING_PROXY_URL }}
+          KONG_API_KEY: ${{ secrets.EVAL_API_KEY }}
+        run: |
+          python3 eval/run_routing_eval.py --target live --hybrid --judge --out reports/staging-gate.json
+      - name: Publish report to job summary
+        if: always()
+        run: cat reports/staging-gate.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routing-eval-report
+          path: reports/
+
+  deploy-production:
+    needs: eval-gate
+    runs-on: ubuntu-latest
+    environment: production        # add required reviewers on this environment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kong/setup-deck@v1
+        with:
+          deck-version: "1.69.0"
+          wrapper: false
+      - name: Sync production control plane (candidate route excluded)
+        run: |
+          deck gateway sync kong/kong.yaml \
+            --konnect-token "${{ secrets.KONNECT_TOKEN }}" \
+            --konnect-control-plane-name shopglobal-prod

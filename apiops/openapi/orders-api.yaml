@@ -1,0 +1,117 @@
+openapi: 3.0.3
+info:
+  title: ShopGlobal Orders API
+  version: 1.0.0
+  description: >-
+    Read a single customer order by its order number. Customer email and shipping
+    address are removed at the gateway (response-transformer), so they are not part
+    of this public contract.
+  contact:
+    name: ShopGlobal Platform Team
+
+# Upstream for this API. Kong creates one Service pointing here (openapi2kong).
+# Same name in every environment because each env runs in its own Kubernetes namespace.
+servers:
+  - url: http://mock-order-api:8081
+
+# ---------- Kong gateway behaviour, owned by the API team (x-kong extensions) ----------
+x-kong-name: orders-api
+x-kong-tags: [shopglobal-ai, apiops, orders]
+x-kong-plugin-key-auth:
+  config:
+    key_names: [apikey]
+    hide_credentials: true
+x-kong-plugin-rate-limiting:
+  config:
+    minute: 60
+    limit_by: consumer
+    policy: redis
+    redis:
+      host: redis-stack
+      port: 6379
+x-kong-plugin-proxy-cache-advanced:
+  config:
+    strategy: memory
+    cache_ttl: 30
+    content_type: [application/json, "application/json; charset=utf-8"]
+    response_code: [200]
+    request_method: [GET]
+x-kong-plugin-request-transformer:
+  config:
+    add:
+      headers: ["X-ShopGlobal-Gateway:kong"]
+x-kong-plugin-response-transformer:
+  config:
+    remove:
+      json: [customer_email, shipping_address]   # PII minimisation
+
+security:
+  - apikey: []
+
+paths:
+  /api/orders/{orderId}:
+    get:
+      operationId: getOrder
+      summary: Get one order by order number
+      tags: [orders]
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: ShopGlobal order number
+          schema:
+            type: string
+            pattern: '^ORD-\d{4}-\d{5}$'
+            example: ORD-2024-10002
+      responses:
+        "200":
+          description: The order (PII removed by the gateway)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Order"}
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Order not found
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "429":
+          description: Rate limit exceeded (60 requests/minute per consumer)
+
+components:
+  securitySchemes:
+    apikey:
+      type: apiKey
+      in: header
+      name: apikey
+  schemas:
+    Order:
+      type: object
+      required: [order_id, status, items, total]
+      properties:
+        order_id: {type: string, example: ORD-2024-10002}
+        customer_id: {type: string, example: CUST-1002}
+        order_date: {type: string, format: date}
+        status:
+          type: string
+          enum: [pending, processing, shipped, delivered, cancelled, refunded, return_requested]
+        shipping_carrier: {type: string, nullable: true, example: UPS}
+        tracking_number: {type: string, nullable: true}
+        estimated_delivery: {type: string, format: date, nullable: true}
+        delivery_date: {type: string, format: date, nullable: true}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              product_id: {type: string}
+              name: {type: string}
+              quantity: {type: integer}
+              price: {type: number}
+        total: {type: number, example: 359.97}
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+        order_id: {type: string}

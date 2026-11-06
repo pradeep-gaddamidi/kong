@@ -1,0 +1,94 @@
+# Eval-gated deployment - runs on a SELF-HOSTED runner on the Mac, because the Kubernetes
+# cluster (Docker Desktop) and the Terraform state (~/.shopglobal-tfstate) live there.
+#
+#   push to main ─► staging: build ─► terraform apply (platform, gateway, portal) ─► wait for DP sync
+#                 ─► LIVE eval gate (routing + LLM judge, eval/gate.json) ─► A/B candidate report
+#                 ─► prod (needs approval on the "production" environment): build ─► apply ─► smoke test
+#
+# Repo secrets: KONNECT_TOKEN (or a system-account token from the platform stack output),
+#               OPENAI_API_KEY, BOT_API_KEY, EVAL_API_KEY
+# Runner labels: self-hosted, macOS, shopglobal   (see README "CI/CD runner")
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ["apiops/**", "terraform/**", "scripts/**", "eval/**", "data/**", "bot/**", "mock_apis/**", "observability/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy # never two applies against the same state at once
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
+  TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+  TF_VAR_bot_api_key: ${{ secrets.BOT_API_KEY }}
+  TF_VAR_eval_api_key: ${{ secrets.EVAL_API_KEY }}
+  TF_IN_AUTOMATION: "1"
+
+jobs:
+  staging:
+    runs-on: [self-hosted, macOS, shopglobal]
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build gateway config (APIOps)
+        run: bash scripts/build-gateway.sh staging
+      - name: Platform - control plane, DP cert, Kubernetes data planes + apps
+        run: |
+          bash scripts/tf.sh platform staging plan
+          bash scripts/tf.sh platform staging apply
+      - name: Gateway - services, routes, AI plugins, consumers
+        run: |
+          bash scripts/tf.sh gateway staging plan
+          bash scripts/tf.sh gateway staging apply
+      - name: Portal - publish the OpenAPI specs
+        run: bash scripts/tf.sh portal staging apply -auto-approve
+      - name: Wait for data planes to load the new config
+        run: bash scripts/wait-for-gateway.sh http://localhost:8000 "${{ secrets.EVAL_API_KEY }}"
+      - name: LIVE eval gate (blocks prod on failure)
+        env:
+          KONG_PROXY_URL: http://localhost:8000
+          KONG_API_KEY: ${{ secrets.EVAL_API_KEY }}
+        run: python3 eval/run_routing_eval.py --target live --hybrid --judge --out reports/staging-gate.json
+      - name: A/B - candidate route report (informational)
+        if: always()
+        env:
+          KONG_PROXY_URL: http://localhost:8000
+          KONG_API_KEY: ${{ secrets.EVAL_API_KEY }}
+        run: |
+          python3 eval/run_routing_eval.py --target live --route /assistant/chat-candidate --no-fail --out reports/staging-candidate.json
+          python3 eval/run_routing_eval.py compare reports/staging-gate.json reports/staging-candidate.json >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Report to job summary
+        if: always()
+        run: cat reports/staging-gate.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-eval
+          path: reports/staging-*
+
+  production:
+    needs: staging
+    runs-on: [self-hosted, macOS, shopglobal]
+    environment: production # add "Required reviewers" on this environment in GitHub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build gateway config (APIOps, prod patches, no A/B route)
+        run: bash scripts/build-gateway.sh prod
+      - name: Platform
+        run: |
+          bash scripts/tf.sh platform prod plan
+          bash scripts/tf.sh platform prod apply
+      - name: Gateway
+        run: |
+          bash scripts/tf.sh gateway prod plan
+          bash scripts/tf.sh gateway prod apply
+      - name: Portal
+        run: bash scripts/tf.sh portal prod apply -auto-approve
+      - name: Smoke test prod (one cheap + one guard check)
+        run: bash scripts/wait-for-gateway.sh http://localhost:8800 "${{ secrets.BOT_API_KEY }}"

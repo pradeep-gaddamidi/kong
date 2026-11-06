@@ -1,0 +1,394 @@
+# ShopGlobal Smart Routing AI Gateway - decK declarative config
+#
+#   deck file validate kong/kong.yaml
+#   deck gateway sync kong/kong.yaml \
+#     --konnect-token "$KONNECT_TOKEN" --konnect-control-plane-name shopglobal-staging
+#
+# Secrets are injected from env vars (decK only substitutes vars prefixed DECK_):
+#   DECK_OPENAI_API_KEY, DECK_BOT_API_KEY, DECK_EVAL_API_KEY
+#
+# Models: OpenAI only. CHEAP tier = gpt-6-luna, PREMIUM tier = gpt-6.1-sol.
+# (The brief named mistral-tiny / o4-mini; o4-mini was shut down by OpenAI on 2026-10-23.)
+#
+# Plugin schemas were written against Kong Gateway 3.11/3.12 docs. Run
+# `deck gateway validate kong/kong.yaml` against your control plane to catch
+# schema drift on newer versions before syncing.
+#
+# Request flow on /assistant/chat (Kong runs plugins by priority, not file order):
+#   key-auth -> ai-prompt-guard (regex, free) -> ai-semantic-prompt-guard (off-topic)
+#   -> ai-rate-limiting-advanced ($ budget per consumer) -> ai-prompt-decorator
+#   -> ai-semantic-cache -> ai-proxy-advanced (SEMANTIC ROUTING) -> prometheus
+
+_format_version: "3.0"
+_info:
+  select_tags:
+    - shopglobal-ai
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1. Shopping assistant LLM service (ai-proxy-advanced owns the upstream)
+  # ---------------------------------------------------------------------------
+  - name: shop-assistant
+    url: http://localhost:32000   # placeholder - ai-proxy-advanced overrides the upstream
+    routes:
+
+      # Free-text chat: the gateway decides which model answers.
+      - name: assistant-chat
+        paths: ["/assistant/chat"]
+        methods: ["POST"]
+        strip_path: true
+        plugins:
+          - name: key-auth
+            config:
+              key_names: ["apikey"]
+              hide_credentials: true
+
+          # Layer 0 guard: cheap regex block for prompt injection (no embedding cost).
+          - name: ai-prompt-guard
+            config:
+              deny_patterns:
+                - "(?i)ignore (all |your |the )?(previous |prior )?instructions"
+                - "(?i)ignora (todas )?(tus|las) instrucciones"
+                - "(?i)system prompt"
+                - "(?i)jailbreak"
+                - "(?i)\\b(write|do)\\b.{0,40}\\b(essay|homework|assignment)\\b"
+                - "(?i)\\b(escribe|haz)\\b.{0,40}\\b(ensayo|tarea|deberes)\\b"
+              allow_all_conversation_history: false
+
+          # Off-topic guard: stops people using the bot as a free general-purpose LLM.
+          - name: ai-semantic-prompt-guard
+            config:
+              embeddings:
+                auth:
+                  header_name: Authorization
+                  header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+                model:
+                  provider: openai
+                  name: text-embedding-3-small
+              vectordb:
+                strategy: redis
+                distance_metric: cosine
+                threshold: 0.5            # max distance to a deny example that counts as a match
+                dimensions: 1536
+                redis:
+                  host: redis-stack
+                  port: 6379
+              rules:
+                match_all_conversation_history: false
+                deny_prompts:
+                  - "Write code, scripts or programs"
+                  - "Do my homework, write an essay or school assignment"
+                  - "Write a 1,000-word essay on a history topic for my class"
+                  - "Write an essay about the French Revolution"
+                  - "Escribe un ensayo de historia para mi clase"
+                  - "Escribe código o programas"
+                  - "Haz mi tarea o escribe un ensayo escolar"
+                  - "Politics, elections, religion, medical or legal advice"
+
+          # Cost guard: the dollar budget per consumer, using the costs set on each target.
+          - name: ai-rate-limiting-advanced
+            config:
+              identifier: consumer          # use `header` + X-Customer-Id for per-shopper budgets
+              tokens_count_strategy: cost   # limits below are micro-dollars (µ$), not tokens
+              strategy: redis
+              sync_rate: 1
+              redis:
+                host: redis-stack
+                port: 6379
+              # Both tiers are OpenAI, so this is ONE combined cap per consumer, in MICRO-DOLLARS
+              # (same unit as input_cost/output_cost): $5/hour = 5,000,000 and $50/day = 50,000,000.
+              llm_providers:
+                - name: openai
+                  limit: [5000000, 50000000]
+                  window_size: [3600, 86400]
+
+          # One system prompt for both models: bilingual behaviour + short answers.
+          - name: ai-prompt-decorator
+            config:
+              prompts:
+                prepend:
+                  - role: system
+                    content: >-
+                      You are the ShopGlobal shopping assistant. Always reply in the
+                      same language the customer used (English or Spanish). Answer
+                      only from the order and product facts provided. Be concise:
+                      at most 3 short sentences for order-status questions.
+
+          # Semantic cache: identical/similar product questions are answered for $0.
+          # PRIVACY: the bot app sends `Cache-Control: no-store` on any request that
+          # carries a customer's order context (cache_control: true honours it), so
+          # one shopper's order can never be served to another.
+          - name: ai-semantic-cache
+            config:
+              cache_control: true
+              cache_ttl: 600
+              ignore_system_prompts: false
+              message_countback: 3
+              embeddings:
+                auth:
+                  header_name: Authorization
+                  header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+                model:
+                  provider: openai
+                  name: text-embedding-3-small
+              vectordb:
+                strategy: redis
+                distance_metric: cosine
+                threshold: 0.1            # max distance: only near-duplicates are cache hits
+                dimensions: 1536
+                redis:
+                  host: redis-stack
+                  port: 6379
+
+          # SMART ROUTING: embed the prompt, pick the closest target description.
+          - name: ai-proxy-advanced
+            config:
+              balancer:
+                algorithm: semantic
+                retries: 2
+                connect_timeout: 3000
+                read_timeout: 30000
+                write_timeout: 30000
+                failover_criteria: ["error", "timeout", "http_429", "http_503"]
+              embeddings:
+                auth:
+                  header_name: Authorization
+                  header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+                model:
+                  provider: openai
+                  name: text-embedding-3-small
+              vectordb:
+                strategy: redis
+                distance_metric: cosine
+                # threshold = MAX cosine DISTANCE to a target description (lower = stricter).
+                # 0.75 left long, detailed questions with no target -> 503 "No peers are available".
+                # 1.0 = the closest description always wins; off-topic prompts are already
+                # stopped by the prompt guards above. Tune with eval/run_routing_eval.py.
+                threshold: 1.0
+                dimensions: 1536
+                redis:
+                  host: redis-stack
+                  port: 6379
+              targets:
+                # Cheap + fast path. Descriptions are BILINGUAL on purpose: routing is
+                # by intent, not language, and Spanish prompts must land here too.
+                - route_type: llm/v1/chat
+                  description: >-
+                    Simple order status lookup: where is my order, track my package,
+                    tracking number, has it shipped, was it delivered, delivery date,
+                    is my order cancelled. Estado de mi pedido, dónde está mi pedido,
+                    rastrear paquete, número de seguimiento, ya se envió, ya se
+                    entregó, cuándo llega, se canceló mi pedido.
+                  auth:
+                    header_name: Authorization
+                    header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+                  model:
+                    provider: openai
+                    name: gpt-6-luna         # CHEAP tier (brief asked for mistral-tiny - see README)
+                    options:
+                      max_tokens: 1024        # cheap model reasons internally: 256 produced an EMPTY answer
+                      # Cost unit = MICRO-DOLLARS (µ$) per 1M tokens ($0.10 -> 100000). Kong stores budget
+                      # counters as whole numbers, so a $0.0001 request in plain dollars rounds up to 1 unit.
+                      input_cost: 100000     # $0.10 per 1M tokens (OpenAI pricing, 2026-10-25)
+                      output_cost: 500000    # $0.50
+                  logging:
+                    log_statistics: true
+                    log_payloads: false      # no prompts/PII in logs
+
+                # Reasoning path.
+                - route_type: llm/v1/chat
+                  description: >-
+                    Complex shopping help: product recommendations, comparing products,
+                    gift ideas, budgets, explaining features, return and refund
+                    eligibility, exchanges, complaints, missing or damaged items,
+                    questions with several parts. Recomendaciones de productos,
+                    comparar productos, regalos, presupuesto, explicar diferencias,
+                    devoluciones y reembolsos, cambios, quejas, artículo dañado o
+                    no recibido, preguntas con varias partes.
+                  auth:
+                    header_name: Authorization
+                    header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+                  model:
+                    provider: openai
+                    name: gpt-6.1-sol        # PREMIUM tier (brief asked for o4-mini, retired 2026-10-23)
+                    options:
+                      max_tokens: 1024
+                      input_cost: 2000000    # µ$: $2.00 per 1M tokens (OpenAI pricing, 2026-10-25)
+                      output_cost: 10000000  # µ$: $10.00
+                  logging:
+                    log_statistics: true
+                    log_payloads: false
+
+      # Hybrid mode (ADR-1): the "Check Order Status" button already knows the intent,
+      # so skip the embedding call entirely and go straight to the cheap model.
+      - name: assistant-order-status
+        paths: ["/assistant/order-status"]
+        methods: ["POST"]
+        strip_path: true
+        plugins:
+          - name: key-auth
+            config:
+              key_names: ["apikey"]
+              hide_credentials: true
+          - name: ai-rate-limiting-advanced
+            config:
+              identifier: consumer
+              tokens_count_strategy: cost
+              strategy: redis
+              sync_rate: 1
+              redis:
+                host: redis-stack
+                port: 6379
+              llm_providers:
+                - name: openai
+                  limit: [2000000, 20000000]   # µ$: $2/hour, $20/day
+                  window_size: [3600, 86400]
+          - name: ai-prompt-decorator
+            config:
+              prompts:
+                prepend:
+                  - role: system
+                    content: >-
+                      You are the ShopGlobal shopping assistant. Reply in the
+                      customer's language (English or Spanish), in at most 2 short
+                      sentences, using only the order facts provided.
+          - name: ai-proxy-advanced
+            config:
+              balancer:
+                algorithm: round-robin
+              targets:
+                - route_type: llm/v1/chat
+                  auth:
+                    header_name: Authorization
+                    header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+                  model:
+                    provider: openai
+                    name: gpt-6-luna
+                    options:
+                      max_tokens: 512
+                      input_cost: 100000     # µ$
+                      output_cost: 500000
+                  logging:
+                    log_statistics: true
+                    log_payloads: false
+
+  # ---------------------------------------------------------------------------
+  # 2. LLM-as-judge route - used ONLY by the eval pipeline (ACL-restricted)
+  # ---------------------------------------------------------------------------
+  - name: eval-judge
+    url: http://localhost:32000
+    routes:
+      - name: eval-judge
+        paths: ["/eval/judge"]
+        methods: ["POST"]
+        strip_path: true
+        plugins:
+          - name: key-auth
+            config:
+              key_names: ["apikey"]
+              hide_credentials: true
+          - name: acl
+            config:
+              allow: ["eval"]
+              hide_groups_header: true
+          - name: ai-proxy
+            config:
+              route_type: llm/v1/chat
+              auth:
+                header_name: Authorization
+                header_value: Bearer ${{ env "DECK_OPENAI_API_KEY" }}
+              model:
+                provider: openai
+                name: gpt-6.1-sol
+                options:
+                  max_tokens: 1200
+                  input_cost: 2000000        # µ$
+                  output_cost: 10000000
+              logging:
+                log_statistics: true
+                log_payloads: false
+
+  # ---------------------------------------------------------------------------
+  # 3. Order Status REST API (mock upstream) - classic API gateway controls
+  # ---------------------------------------------------------------------------
+  - name: orders-api
+    url: http://mock-order-api:8081
+    routes:
+      - name: orders-api
+        paths: ["/api/orders"]
+        methods: ["GET"]
+        strip_path: false
+    plugins:
+      - name: key-auth
+        config:
+          key_names: ["apikey"]
+          hide_credentials: true
+      - name: rate-limiting
+        config:
+          minute: 60
+          limit_by: consumer
+          policy: redis
+          redis:
+            host: redis-stack
+            port: 6379
+      - name: proxy-cache-advanced
+        config:
+          strategy: memory
+          cache_ttl: 30
+          content_type: ["application/json", "application/json; charset=utf-8"]
+          response_code: [200]
+          request_method: ["GET"]
+      - name: request-transformer
+        config:
+          add:
+            headers: ["X-ShopGlobal-Gateway:kong"]
+      # PII minimisation: the bot never needs email or address to answer "where is my order".
+      - name: response-transformer
+        config:
+          remove:
+            json: ["customer_email", "shipping_address"]
+
+  # ---------------------------------------------------------------------------
+  # 4. Product Catalog API (same mock upstream) - facts for product questions
+  # ---------------------------------------------------------------------------
+  - name: catalog-api
+    url: http://mock-order-api:8081
+    routes:
+      - name: catalog-api
+        paths: ["/api/products"]
+        methods: ["GET"]
+        strip_path: false
+    plugins:
+      - name: key-auth
+        config:
+          key_names: ["apikey"]
+          hide_credentials: true
+      - name: proxy-cache-advanced      # catalog changes rarely: cache 5 minutes
+        config:
+          strategy: memory
+          cache_ttl: 300
+          content_type: ["application/json", "application/json; charset=utf-8"]
+          response_code: [200]
+          request_method: ["GET"]
+
+consumers:
+  - username: shop-bot-web           # the ShopGlobal web/mobile bot backend
+    keyauth_credentials:
+      - key: ${{ env "DECK_BOT_API_KEY" }}
+  - username: eval-runner            # CI eval pipeline
+    keyauth_credentials:
+      - key: ${{ env "DECK_EVAL_API_KEY" }}
+    acls:
+      - group: eval
+
+plugins:
+  # AI metrics: llm cost, tokens, latency, cache hits - per model, per consumer.
+  - name: prometheus
+    config:
+      ai_metrics: true
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+      upstream_health_metrics: true
+      per_consumer: true

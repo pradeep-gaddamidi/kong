@@ -1,0 +1,10 @@
+{
+  "_note": "Release gate for routing-policy changes. CI fails the deploy if any threshold is breached. Under-routing (complex -> cheap model) is a quality risk, so it is held tighter than over-routing (simple -> expensive model), which is a cost leak.",
+  "min_routing_accuracy": 0.90,
+  "max_under_route_rate": 0.05,
+  "max_over_route_rate": 0.10,
+  "max_language_parity_gap": 0.05,
+  "min_guard_block_rate": 1.0,
+  "min_success_rate": 0.85,
+  "min_savings_pct": 30.0
+}

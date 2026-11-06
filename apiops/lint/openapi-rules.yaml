@@ -1,0 +1,33 @@
+# Lint rules for the OpenAPI specs (run with: deck file lint -s <spec> apiops/lint/openapi-rules.yaml)
+# Spectral/vacuum ruleset format. Errors fail the pipeline.
+rules:
+  servers-required:
+    description: Every API must declare its upstream in servers[]
+    given: $
+    severity: error
+    then: {field: servers, function: truthy}
+  kong-name-required:
+    description: x-kong-name gives the Kong service a stable name (and stable IDs)
+    given: $
+    severity: error
+    then: {field: x-kong-name, function: truthy}
+  kong-tags-required:
+    description: x-kong-tags must include shopglobal-ai so entities are traceable
+    given: $.x-kong-tags
+    severity: error
+    then: {function: truthy}
+  operation-id-required:
+    description: Every operation needs an operationId (it becomes the Kong route name)
+    given: $.paths[*][get,put,post,delete,patch]
+    severity: error
+    then: {field: operationId, function: truthy}
+  security-declared:
+    description: APIs must declare a security scheme (key-auth / OIDC)
+    given: $
+    severity: error
+    then: {field: security, function: truthy}
+  operation-summary:
+    description: Operations should have a summary for the Dev Portal
+    given: $.paths[*][get,put,post,delete,patch]
+    severity: warn
+    then: {field: summary, function: truthy}

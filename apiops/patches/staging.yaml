@@ -1,0 +1,9 @@
+# Environment patches for STAGING (applied by `deck file patch` after merge).
+# Staging keeps the base values from the policy files: $5/hour and $50/day per consumer
+# (micro-dollars), which is plenty for evaluation runs and catches runaway loops early.
+_format_version: "1.0"
+patches:
+  - selectors:
+      - "$..services[*]"
+    values:
+      read_timeout: 60000

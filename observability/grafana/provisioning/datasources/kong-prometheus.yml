@@ -1,0 +1,11 @@
+# Auto-provisioned on Grafana start (mounted by docker-compose.yml)
+apiVersion: 1
+datasources:
+  - name: Kong Prometheus
+    uid: kong-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s

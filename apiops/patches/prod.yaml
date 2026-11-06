@@ -1,0 +1,19 @@
+# Environment patches for PRODUCTION (applied by `deck file patch` after merge).
+# All shoppers reach Kong through ONE consumer (the bot backend), so production needs
+# a larger shared budget than staging. Units are micro-dollars (see ADR-3):
+#   chat route:         $50/hour, $500/day
+#   order-status route: $20/hour, $200/day
+_format_version: "1.0"
+patches:
+  - selectors:
+      - "$..routes[?(@.name=='shop-assistant_chat')].plugins[?(@.name=='ai-rate-limiting-advanced')].config.llm_providers[*]"
+    values:
+      limit: [50000000, 500000000]
+  - selectors:
+      - "$..routes[?(@.name=='shop-assistant_orderstatus')].plugins[?(@.name=='ai-rate-limiting-advanced')].config.llm_providers[*]"
+    values:
+      limit: [20000000, 200000000]
+  - selectors:
+      - "$..services[*]"
+    values:
+      read_timeout: 60000

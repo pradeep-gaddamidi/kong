@@ -1,0 +1,272 @@
+# AI POLICY for the Shopping Assistant API - owned by the PLATFORM team.
+# Attached by the build to routes generated from apiops/openapi/shop-assistant-api.yaml:
+#   shop-assistant_chat        -> full smart-routing chain (guards, budget, decorator, cache, semantic router)
+#   shop-assistant_orderstatus -> button fast path (budget, decorator, cheap model only)
+# Secrets: provider keys are Kong VAULT REFERENCES ({vault://env/kong-openai-auth-header}).
+# The data plane reads env var KONG_OPENAI_AUTH_HEADER ("Bearer sk-...") from a Kubernetes Secret,
+# so no key appears in this file, the built config, Git, or Terraform state.
+# Budget units: micro-dollars (input_cost/output_cost and limits). Thresholds: max cosine distance.
+_format_version: '1.0'
+add-plugins:
+- selectors:
+  - $..routes[?(@.name=='shop-assistant_chat')]
+  overwrite: true
+  plugins:
+  - name: key-auth
+    config:
+      key_names:
+      - apikey
+      hide_credentials: true
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-prompt-guard
+    config:
+      deny_patterns:
+      - (?i)ignore (all |your |the )?(previous |prior )?instructions
+      - (?i)ignora (todas )?(tus|las) instrucciones
+      - (?i)system prompt
+      - (?i)jailbreak
+      - (?i)\b(write|do)\b.{0,40}\b(essay|homework|assignment)\b
+      - (?i)\b(escribe|haz)\b.{0,40}\b(ensayo|tarea|deberes)\b
+      allow_all_conversation_history: false
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-semantic-prompt-guard
+    config:
+      embeddings:
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: text-embedding-3-small
+      vectordb:
+        strategy: redis
+        distance_metric: cosine
+        threshold: 0.5
+        dimensions: 1536
+        redis:
+          host: redis-stack
+          port: 6379
+      rules:
+        match_all_conversation_history: false
+        deny_prompts:
+        - Write code, scripts or programs
+        - Do my homework, write an essay or school assignment
+        - Write a 1,000-word essay on a history topic for my class
+        - Write an essay about the French Revolution
+        - Escribe un ensayo de historia para mi clase
+        - "Escribe c\xF3digo o programas"
+        - Haz mi tarea o escribe un ensayo escolar
+        - Politics, elections, religion, medical or legal advice
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-rate-limiting-advanced
+    config:
+      identifier: consumer
+      tokens_count_strategy: cost
+      strategy: redis
+      sync_rate: 1
+      redis:
+        host: redis-stack
+        port: 6379
+      llm_providers:
+      - name: openai
+        limit:
+        - 5000000
+        - 50000000
+        window_size:
+        - 3600
+        - 86400
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-prompt-decorator
+    config:
+      prompts:
+        prepend:
+        - role: system
+          content: >-
+            You are the ShopGlobal shopping assistant. Always reply in the same language the customer used
+            (English or Spanish). Use ONLY the order and product facts provided for anything specific to
+            ShopGlobal: prices, stock, order status, dates, policies. You may use general knowledge to explain
+            concepts (for example what 4K means for photo editing), but never invent ShopGlobal facts.
+            If the facts do not answer the question, say so in one sentence and give one concrete next step,
+            such as contacting ShopGlobal support with the order number.
+            Be concise: at most 3 short sentences for order-status questions.
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-semantic-cache
+    config:
+      cache_control: true
+      cache_ttl: 600
+      ignore_system_prompts: false
+      message_countback: 3
+      embeddings:
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: text-embedding-3-small
+      vectordb:
+        strategy: redis
+        distance_metric: cosine
+        threshold: 0.1
+        dimensions: 1536
+        redis:
+          host: redis-stack
+          port: 6379
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-proxy-advanced
+    config:
+      balancer:
+        algorithm: semantic
+        retries: 2
+        connect_timeout: 3000
+        read_timeout: 30000
+        write_timeout: 30000
+        failover_criteria:
+        - error
+        - timeout
+        - http_429
+        - http_503
+      embeddings:
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: text-embedding-3-small
+      vectordb:
+        strategy: redis
+        distance_metric: cosine
+        threshold: 1.0
+        dimensions: 1536
+        redis:
+          host: redis-stack
+          port: 6379
+      targets:
+      - route_type: llm/v1/chat
+        description: "Simple order status lookup: where is my order, track my package, tracking number, has it shipped,\
+          \ was it delivered, delivery date, is my order cancelled. Estado de mi pedido, d\xF3nde est\xE1 mi pedido,\
+          \ rastrear paquete, n\xFAmero de seguimiento, ya se envi\xF3, ya se entreg\xF3, cu\xE1ndo llega, se cancel\xF3\
+          \ mi pedido."
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: gpt-6-luna
+          options:
+            max_tokens: 1024
+            input_cost: 100000
+            output_cost: 500000
+        logging:
+          log_statistics: true
+          log_payloads: false
+      - route_type: llm/v1/chat
+        description: "Complex shopping help: product recommendations, comparing products, gift ideas, budgets, explaining\
+          \ features, return and refund eligibility, exchanges, complaints, missing or damaged items, questions\
+          \ with several parts. Recomendaciones de productos, comparar productos, regalos, presupuesto, explicar\
+          \ diferencias, devoluciones y reembolsos, cambios, quejas, art\xEDculo da\xF1ado o no recibido, preguntas\
+          \ con varias partes."
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: gpt-6.1-sol
+          options:
+            max_tokens: 1024
+            input_cost: 2000000
+            output_cost: 10000000
+        logging:
+          log_statistics: true
+          log_payloads: false
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+- selectors:
+  - $..routes[?(@.name=='shop-assistant_orderstatus')]
+  overwrite: true
+  plugins:
+  - name: key-auth
+    config:
+      key_names:
+      - apikey
+      hide_credentials: true
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-rate-limiting-advanced
+    config:
+      identifier: consumer
+      tokens_count_strategy: cost
+      strategy: redis
+      sync_rate: 1
+      redis:
+        host: redis-stack
+        port: 6379
+      llm_providers:
+      - name: openai
+        limit:
+        - 2000000
+        - 20000000
+        window_size:
+        - 3600
+        - 86400
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-prompt-decorator
+    config:
+      prompts:
+        prepend:
+        - role: system
+          content: >-
+            You are the ShopGlobal shopping assistant. Reply in the customer's language (English or Spanish), in
+            at most 2 short sentences, using only the order facts provided. If the facts do not answer the
+            question, end with one concrete next step, such as contacting ShopGlobal support with the order number.
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy
+  - name: ai-proxy-advanced
+    config:
+      balancer:
+        algorithm: round-robin
+      targets:
+      - route_type: llm/v1/chat
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: gpt-6-luna
+          options:
+            max_tokens: 512
+            input_cost: 100000
+            output_cost: 500000
+        logging:
+          log_statistics: true
+          log_payloads: false
+    tags:
+    - shopglobal-ai
+    - apiops
+    - ai-policy

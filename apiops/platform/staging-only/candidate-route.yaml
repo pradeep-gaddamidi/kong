@@ -1,0 +1,133 @@
+# STAGING ONLY: A/B candidate routing policy (v2 target descriptions, same threshold).
+# Merged into the staging build only; production never receives it. ACL: eval group only.
+_format_version: '3.0'
+routes:
+- name: assistant-chat-candidate
+  service:
+    name: shop-assistant
+  paths:
+  - ~/assistant/chat-candidate$
+  methods:
+  - POST
+  strip_path: false
+  plugins:
+  - name: key-auth
+    config:
+      key_names:
+      - apikey
+      hide_credentials: true
+    tags:
+    - shopglobal-ai
+    - platform
+    - ab-candidate
+  - name: acl
+    config:
+      allow:
+      - eval
+      hide_groups_header: true
+    tags:
+    - shopglobal-ai
+    - platform
+    - ab-candidate
+  - name: ai-prompt-guard
+    config:
+      deny_patterns:
+      - (?i)ignore (all |your |the )?(previous |prior )?instructions
+      - (?i)ignora (todas )?(tus|las) instrucciones
+      - (?i)system prompt
+      - (?i)jailbreak
+      - (?i)\b(write|do)\b.{0,40}\b(essay|homework|assignment)\b
+      - (?i)\b(escribe|haz)\b.{0,40}\b(ensayo|tarea|deberes)\b
+    tags:
+    - shopglobal-ai
+    - platform
+    - ab-candidate
+  - name: ai-prompt-decorator
+    config:
+      prompts:
+        prepend:
+        - role: system
+          content: >-
+            You are the ShopGlobal shopping assistant. Always reply in the same language the customer used
+            (English or Spanish). Use ONLY the order and product facts provided for anything specific to
+            ShopGlobal: prices, stock, order status, dates, policies. You may use general knowledge to explain
+            concepts (for example what 4K means for photo editing), but never invent ShopGlobal facts.
+            If the facts do not answer the question, say so in one sentence and give one concrete next step,
+            such as contacting ShopGlobal support with the order number.
+            Be concise: at most 3 short sentences for order-status questions.
+    tags:
+    - shopglobal-ai
+    - platform
+    - ab-candidate
+  - name: ai-proxy-advanced
+    config:
+      balancer:
+        algorithm: semantic
+        retries: 2
+        failover_criteria:
+        - error
+        - timeout
+        - http_429
+        - http_503
+      embeddings:
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: text-embedding-3-small
+      vectordb:
+        strategy: redis
+        distance_metric: cosine
+        threshold: 1.0
+        dimensions: 1536
+        redis:
+          host: redis-stack
+          port: 6379
+      targets:
+      - route_type: llm/v1/chat
+        description: "ONE simple order status lookup and nothing else: where is my order, track my package, tracking\
+          \ number, did it ship, was it delivered, delivery date, was it cancelled; also very short or slang messages\
+          \ that only contain an order number. SOLO una consulta simple del estado del pedido: d\xF3nde est\xE1\
+          \ mi pedido, rastrear, n\xFAmero de seguimiento, ya lo mandaron, ya se entreg\xF3, cu\xE1ndo llega, se\
+          \ cancel\xF3."
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: gpt-6-luna
+          options:
+            max_tokens: 1024
+            input_cost: 100000
+            output_cost: 500000
+        logging:
+          log_statistics: true
+          log_payloads: false
+      - route_type: llm/v1/chat
+        description: >-
+          Anything that needs judgement or has more than one request: product recommendations, comparisons, gifts,
+          budgets, explanations, returns, refunds, exchanges, swapping an item, complaints, delivered but not received,
+          damaged items. Cualquier cosa que requiera criterio o tenga varias peticiones: recomendaciones, comparar,
+          regalos, presupuesto, devoluciones, reembolsos, cambios, quejas, entregado pero no recibido.
+        auth:
+          header_name: Authorization
+          header_value: '{vault://env/kong-openai-auth-header}'
+        model:
+          provider: openai
+          name: gpt-6.1-sol
+          options:
+            max_tokens: 1024
+            input_cost: 2000000
+            output_cost: 10000000
+        logging:
+          log_statistics: true
+          log_payloads: false
+    tags:
+    - shopglobal-ai
+    - platform
+    - ab-candidate
+  tags:
+  - shopglobal-ai
+  - platform
+  - ab-candidate

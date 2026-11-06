@@ -1,0 +1,14 @@
+# Platform-owned global plugins (apply to every route).
+_format_version: '3.0'
+plugins:
+- name: prometheus
+  config:
+    ai_metrics: true
+    status_code_metrics: true
+    latency_metrics: true
+    bandwidth_metrics: true
+    upstream_health_metrics: true
+    per_consumer: true
+  tags:
+  - shopglobal-ai
+  - platform

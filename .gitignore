@@ -1,0 +1,22 @@
+# secrets - never commit
+.env
+
+# live eval reports can contain model answers; keep the simulated samples only
+reports/*
+!reports/sim-*
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# APIOps build output (CI uploads it as an artifact)
+build/
+terraform/stacks/gateway/gateway.generated.tf
+
+# Terraform: state lives in ~/.shopglobal-tfstate (outside the repo); never commit plans or secret tfvars
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.auto.tfvars
+secrets.tfvars

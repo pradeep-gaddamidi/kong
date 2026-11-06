@@ -1,0 +1,38 @@
+{
+  "_note": "USD per 1M tokens, from OpenAI's pricing page (checked 2026-10-25). Must match input_cost/output_cost in kong/kong.yaml. The test set refers to TIERS, not model names, so a model swap only changes this file and kong.yaml.",
+  "tiers": {
+    "cheap": "gpt-6-luna",
+    "premium": "gpt-6.1-sol"
+  },
+  "baseline_model": "gpt-6.1-sol",
+  "models": {
+    "gpt-6.1-sol": {
+      "tier": "premium",
+      "input": 2.00,
+      "output": 10.00,
+      "aliases": ["gpt-6.1-sol"]
+    },
+    "gpt-6-luna": {
+      "tier": "cheap",
+      "input": 0.10,
+      "output": 0.50,
+      "aliases": ["gpt-6-luna"]
+    }
+  },
+  "brief_models": {
+    "_note": "Models named in the use-case brief. o4-mini was shut down by OpenAI on 2026-10-23; mistral-tiny is a legacy Mistral alias. Kept for traceability only.",
+    "premium": "o4-mini",
+    "cheap": "mistral-tiny"
+  },
+  "baseline": {
+    "_note": "Assumptions for the 'no gateway, everything on the premium model' baseline. Estimates - state them in the Blueprint.",
+    "reasoning_tokens_est": 200,
+    "blocked_prompt_completion_tokens": 1300
+  },
+  "embeddings": {
+    "model": "text-embedding-3-small",
+    "input": 0.02,
+    "calls_per_semantic_request": 3,
+    "_calls_note": "/assistant/chat embeds the prompt up to 3x: semantic prompt guard, semantic cache, semantic router. The hybrid /assistant/order-status route embeds 0x. Embedding price not shown on OpenAI's pricing page on 2026-10-25 - verify."
+  }
+}

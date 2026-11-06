@@ -1,0 +1,86 @@
+# PR checks - run on GitHub-hosted runners, need NO secrets and touch NOTHING live.
+#   1 APIOps build for staging AND prod: spec lint -> openapi2kong -> policies -> patch -> lint/validate -> kong2tf
+#   2 Terraform: fmt check + validate every stack (no state, no credentials)
+#   3 Evaluation harness: offline simulated routing run (control vs candidate) + A/B compare
+# Reviewers see the exact gateway config each env will get in the "gateway-build" artifact.
+name: pr-checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apiops-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [staging, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kong/setup-deck@v1
+        with:
+          deck-version: "1.69.0"
+          wrapper: false
+      - run: pip install pyyaml
+      - name: Build gateway config from OpenAPI (${{ matrix.env }})
+        run: bash scripts/build-gateway.sh ${{ matrix.env }}
+      - name: Summary
+        run: |
+          {
+            echo "### Gateway build: ${{ matrix.env }}"
+            echo '```'
+            grep -E '^resource' terraform/stacks/gateway/gateway.generated.tf | awk '{print $2}' | sort | uniq -c
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gateway-build-${{ matrix.env }}
+          path: |
+            build/${{ matrix.env }}/kong.yaml
+            terraform/stacks/gateway/gateway.generated.tf
+
+  terraform-validate:
+    needs: apiops-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kong/setup-deck@v1
+        with:
+          deck-version: "1.69.0"
+          wrapper: false
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - run: pip install pyyaml
+      - name: Generate gateway resources (needed to validate the gateway stack)
+        run: bash scripts/build-gateway.sh staging
+      - name: terraform fmt
+        run: |
+          terraform fmt -check -recursive terraform/ || { echo "Fix with: terraform fmt -recursive terraform/"; exit 1; }
+      - name: terraform validate (all stacks)
+        run: |
+          for s in platform gateway portal monitoring; do
+            echo "== $s"
+            terraform -chdir=terraform/stacks/$s init -backend=false -input=false >/dev/null
+            terraform -chdir=terraform/stacks/$s validate
+          done
+
+  eval-simulated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Simulated routing eval (harness self-test, no keys)
+        run: |
+          python3 eval/run_routing_eval.py --target simulate --no-fail --out reports/sim-control.json
+          python3 eval/run_routing_eval.py --target simulate --sim-policy candidate --no-fail --out reports/sim-candidate.json
+          python3 eval/run_routing_eval.py compare reports/sim-control.json reports/sim-candidate.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sim-eval
+          path: reports/sim-*
